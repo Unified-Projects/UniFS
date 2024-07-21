@@ -298,7 +298,7 @@ static void UniFS_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 					
 					if(!Done){
 						// No Then create it
-						InoMap.push_back({NextAllocatableIno++, Dir.Ino, Dirs[j], (x.Sector + i) * 512, (uint64_t)j});
+						InoMap.push_back({NextAllocatableIno++, Dir.Ino, Dirs[j], (x.Sector + i), (uint64_t)j});
 						dirbuf_add(req, &b, strdup(Dirs[j].FileName), NextAllocatableIno-1, ((Dirs[j].FLAGS & 0b100) > 0), Dirs[j].FileSize);
 					}
 				}
@@ -423,7 +423,9 @@ static void UniFS_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
 	Ent.File.Minute = localTime->tm_min;
 	Ent.File.Second = localTime->tm_sec;
 
-	fseek(Disk, Ent.SectorOfSettings * 512 + Ent.EntryNumber * sizeof(DirectoryEntry), SEEK_SET);
+	std::cout << "HMM " << (Ent.SectorOfSettings * 512) + (Ent.EntryNumber * sizeof(DirectoryEntry)) << std::endl;
+
+	fseek(Disk, (Ent.SectorOfSettings * 512) + (Ent.EntryNumber * sizeof(DirectoryEntry)), SEEK_SET);
 	fwrite((void*)(&Ent.File), sizeof(DirectoryEntry), 1, Disk);
 	fflush(Disk);
 
@@ -432,15 +434,92 @@ static void UniFS_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
 
 static void UniFS_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, struct fuse_file_info *fi) {
 	std::cout << "Create: " << name << std::endl;
-	
-	struct fuse_entry_param e;
-	memset(&e, 0, sizeof(e));
-	e.ino = 2;
-	e.attr_timeout = 1.0;
-	e.entry_timeout = 1.0;
-	UniFS_stat(e.ino, &e.attr);
 
-    fuse_reply_create(req, &e, fi);
+	for(auto x : InoMap){
+		if (x.ParentIno == parent){
+			// TODO LFN
+
+			if(strlen(name) == strlen(x.File.FileName)){
+				if(!memcmp(name, x.File.FileName, strlen(name))){
+					// Already present
+					fuse_reply_err(req, EALREADY);
+					return;
+				}
+			}
+		}
+	}
+
+	// Is a new file
+	// Parent should be a directory
+	// TODO CONFIRM
+	// Get File Sectors
+	auto DirSectors = ParseClusterMapIntoSectors(FileMaster, Disk, GetIno(parent).File.StoredCluster, GetIno(parent).File.SectorIndex);
+
+	for(auto x : DirSectors){
+		for(int i = 0; i < x.Count; i++){
+			// Read sector off disk
+			fseek(Disk, (x.Sector + i) * 512, SEEK_SET);
+			fread((void*)SectorStore, 512, 1, Disk);
+
+			// Parse into directory entries (11 per sector)
+			DirectoryEntry* Dirs = (DirectoryEntry*)(SectorStore);
+
+			for(int j = 0; j < 11; j++){
+				if((Dirs[j].FLAGS & 0b100000)){ // If it Exists, Skip
+					continue;
+				}
+
+				// Found a empty entry
+				Dirs[j] = {
+					(uint16_t)(0b100000 |(((mode & S_IFDIR) > 0) * 0b100) | (((mode & S_IFLNK) > 0) * 0b1000)), // FLAGS FOR TYPES
+					{0},
+					0, 0, // No Data
+					0, 0, 0, 0, 0, 0, 0, // Date and Time (TBC)
+					0, // File Size
+					0 // Reserved
+				};
+
+				// Get current time
+				std::time_t now = std::time(nullptr);
+				std::tm* localTime = std::localtime(&now);
+
+				// Extract date and time components
+				Dirs[j].Year = 1900 + localTime->tm_year;         // tm_year is years since 1900
+				Dirs[j].Month = 1 + localTime->tm_mon;            // tm_mon is 0-based (0 = January)
+				Dirs[j].Date = localTime->tm_mday;
+				Dirs[j].Hour = localTime->tm_hour;
+				Dirs[j].Minute = localTime->tm_min;
+				Dirs[j].Second = localTime->tm_sec;
+
+				if(strlen(name) > 16){
+					std::cout << "Cannot Use LFN on new file!" << std::endl;
+				}
+				
+				strncpy(Dirs[j].FileName, name, min(16, strlen(name)));
+
+				InoMap.push_back({NextAllocatableIno++, parent, Dirs[j], x.Sector + i, (uint64_t)j});
+
+				fseek(Disk, (x.Sector + i) * 512, SEEK_SET);
+				fwrite((void*)(SectorStore), 512, 1, Disk);
+				fflush(Disk);
+
+				struct fuse_entry_param e;
+				memset(&e, 0, sizeof(e));
+				e.ino = NextAllocatableIno-1;
+				e.attr_timeout = 1.0;
+				e.entry_timeout = 1.0;
+				UniFS_stat(e.ino, &e.attr);
+
+				fuse_reply_create(req, &e, fi);
+				return;
+
+				// TODO LFN
+			}
+		}
+	}
+
+	// If we made it here we need to allocate a new sector!
+	fuse_reply_err(req, ENOSPC);
 }
 
 static void UniFS_access(fuse_req_t req, fuse_ino_t ino, int mask) {
