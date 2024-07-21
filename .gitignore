@@ -1,0 +1,6 @@
+*.o
+UniFS_Disker
+UniFS_Mounter
+UniFS.img
+.vscode/
+.DS_Store

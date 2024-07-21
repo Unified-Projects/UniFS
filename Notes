@@ -1,0 +1,6 @@
+Cluster Map Allocations:
+    - If no space aviable to allocate a cluster map, the first sector fo the cluster should be used as a new map
+
+
+TODOS:
+    - Add checks for entry types and if they are actually files/directories/clusters
