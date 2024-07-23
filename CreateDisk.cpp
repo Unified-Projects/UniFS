@@ -5,7 +5,7 @@
 
 int main() {
     const std::string filename = "UniFS.img";
-    const std::streamsize size = 512 * 1024 * 1024; // 512 MB
+    const std::streamsize size = 1 * 1024 * 1024; // 512 MB
 
     // Create and open a binary file for output
     std::ofstream file(filename, std::ios::binary);
@@ -70,7 +70,7 @@ int main() {
     file.write((const char*)(&RootMapEntry), sizeof(ClusterEntry));
 
     // Create Hello File Map Allocation
-    ClusterEntry HelloEntry = {0b1001, 0, 0, 1, 1, 0};
+    ClusterEntry HelloEntry = {0b1001, 0, 0, 1, 2, 0};
 
     // Write 
     file.write((const char*)(&HelloEntry), sizeof(ClusterEntry));

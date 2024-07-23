@@ -44,10 +44,52 @@ inline ClusterEntry FindClusterEntry(MasterRecord& FileMaster, FILE* FD, uint64_
         return {};
     }
 
+    for(int i = 0; i < 32; i++){
+        if(ClusterMapEntryList[i].SectorStart == SectorIndex){
+            return ClusterMapEntryList[i];
+        }
+    }
+
     // Find cluster entry
-    return ClusterMapEntryList[SectorIndex];
+    return {}; // Error
 
     // TODO: MultiSector ClusterMaps
+}
+
+struct SectorListing{
+    uint64_t Sector = 0;
+    uint16_t Count = 0;
+};
+
+inline std::vector<SectorListing> ParseClusterMapIntoSectors(MasterRecord& FileMaster, FILE* FD, uint64_t StartCluster, uint16_t StartSectorIndex){
+    if(StartCluster == 0){
+        return {}; // For new allocations
+    }
+
+    auto StartClusterEntry = FindClusterEntry(FileMaster, FD, StartCluster, StartSectorIndex);
+
+    if(StartClusterEntry.AllocationSize == 0){
+        return {};
+    }
+
+    std::vector<SectorListing> ReturnVec = {};
+    
+    // No need to search for other clusters
+    ReturnVec.push_back({StartCluster*FileMaster.ClusterSize + StartSectorIndex, StartClusterEntry.AllocationSize});
+
+    while(StartClusterEntry.NextCluster){
+        auto Backup = StartClusterEntry;
+        StartClusterEntry = FindClusterEntry(FileMaster, FD, StartClusterEntry.NextCluster, StartClusterEntry.NextSectorIndex);
+
+        if(StartClusterEntry.AllocationSize == 0){
+            return {};
+        }
+
+        // No need to search for other clusters
+        ReturnVec.push_back({Backup.NextCluster*FileMaster.ClusterSize + Backup.NextSectorIndex, StartClusterEntry.AllocationSize});
+    }
+
+    return ReturnVec;
 }
 
 void AllocateClusterMap(MasterRecord& FileMaster, FILE* FD, uint64_t StartCluster, uint16_t StartSectorIndex){
@@ -66,9 +108,29 @@ struct AllocatedRegion{
     uint16_t Sector = 0;
     uint16_t Count = 0;
 };
-int AllocateSize(MasterRecord& FileMaster, FILE* FD, uint64_t StartCluster, uint16_t StartSectorIndex, size_t Bytes, uint8_t Flags){
+int AllocateSize(MasterRecord& FileMaster, FILE* FD, uint64_t StartCluster, uint16_t StartSectorIndex, size_t Bytes, size_t PrevSize, uint8_t Flags, ClusterEntry* NewAllocationReturnPoint = nullptr){
+    auto CurrentDisk = ParseClusterMapIntoSectors(FileMaster, FD, StartCluster, StartSectorIndex);
+
+    size_t CurrentAllocationSectors = 0;
+    for(auto x : CurrentDisk){
+        CurrentAllocationSectors+=x.Count;
+    }
+
+    bool FreshAllocation = !StartCluster;
+
+    if(!FreshAllocation && Bytes < (512*CurrentAllocationSectors - PrevSize)){
+        return 0; // No Need to allocate data
+    }
+
     // Calculate Sectors Needed
-    size_t Sectors = floor(Bytes / 512.0); // Floored as if not a multiple of 512 there is still data available to use in sector
+    size_t Sectors = 0;
+    if(!FreshAllocation){
+        Sectors = ceil((Bytes - (512*CurrentAllocationSectors - PrevSize)) / 512.0);
+    }
+    else{
+        Sectors = ceil(Bytes / 512.0);
+    }
+
     size_t RemainingData = Sectors;
 
     if(RemainingData == 0){
@@ -96,7 +158,7 @@ int AllocateSize(MasterRecord& FileMaster, FILE* FD, uint64_t StartCluster, uint
 
             // See how much space is left in its cluster
             if(FileMaster.ClusterSize > 32){
-                std::cout << "Multi-sector Cluster Maps Are Unsupported" << std::endl;
+                std::cout << "Multi-sector Cluster Maps Are Unsupported: " << FileMaster.ClusterSize << std::endl;
                 continue;
             }
             uint16_t UsedAllocations = 0;
@@ -109,7 +171,7 @@ int AllocateSize(MasterRecord& FileMaster, FILE* FD, uint64_t StartCluster, uint
                     UsedAllocations += AllocateSize_ClusterSearchEntryList[j].AllocationSize;
                 else if(index < 0){
                     if(AllocateSize_ClusterSearchEntryList[j].AllocationSize){ // Was Allocated But Not Anymore
-                        Allocations.push_back({(AllocateSize_ClusterMapSearchAllocation[i].StoredCluster * FileMaster.ClusterSize + AllocateSize_ClusterMapSearchAllocation[i].SectorIndex), (uint8_t)j, CurrentSelectedCluster, (uint16_t)j, AllocateSize_ClusterSearchEntryList[j].AllocationSize});
+                        Allocations.push_back({(AllocateSize_ClusterMapSearchAllocation[i].StoredCluster * FileMaster.ClusterSize + AllocateSize_ClusterMapSearchAllocation[i].SectorIndex), (uint8_t)j, CurrentSelectedCluster, (uint16_t)j, (uint16_t)fmin(AllocateSize_ClusterSearchEntryList[j].AllocationSize, (uint16_t)RemainingData)});
                     }
                     else{
                         index = j;
@@ -125,7 +187,7 @@ int AllocateSize(MasterRecord& FileMaster, FILE* FD, uint64_t StartCluster, uint
             // Allocate All that is needed
             uint16_t Available = FileMaster.ClusterSize - UsedAllocations;
 
-            Allocations.push_back({(AllocateSize_ClusterMapSearchAllocation[i].StoredCluster * FileMaster.ClusterSize + AllocateSize_ClusterMapSearchAllocation[i].SectorIndex), (uint8_t)index, CurrentSelectedCluster, UsedAllocations, Available});
+            Allocations.push_back({(AllocateSize_ClusterMapSearchAllocation[i].StoredCluster * FileMaster.ClusterSize + AllocateSize_ClusterMapSearchAllocation[i].SectorIndex), (uint8_t)index, CurrentSelectedCluster, UsedAllocations, (uint16_t)fmin(Available, (uint16_t)RemainingData)});
 
             if(Available > RemainingData){
                 RemainingData = 0;
@@ -136,6 +198,22 @@ int AllocateSize(MasterRecord& FileMaster, FILE* FD, uint64_t StartCluster, uint
             else{
                 Available = 0;
                 RemainingData -= Available;
+
+                // First locate where the cluster map is kept
+                auto ClusterMapEnt = FindClusterMapEntry(FileMaster, FD, AllocateSize_ClusterMapSearchAllocation[i].StoredCluster);
+
+                ClusterMapEnt.Flags |= 0b100;
+
+                // Load the list
+                fseek(FD, ((FileMaster.ClusterMapOffset + (AllocateSize_ClusterMapSearchAllocation[i].StoredCluster / 32)) * 512) + ((AllocateSize_ClusterMapSearchAllocation[i].StoredCluster % FileMaster.ClusterSize) * sizeof(ClusterMapEnt)), SEEK_SET);
+                fwrite((void*)(&ClusterMapEnt), sizeof(ClusterMapEnt), 1, FD);
+
+                if(((AllocateSize_ClusterMapSearchAllocation[i].StoredCluster % FileMaster.ClusterSize) * sizeof(ClusterMapEnt)) > 32){
+                    std::cout << "MultiSector ClusterEntries are a STUB" << std::endl;
+                    return -1;
+                }
+
+                // Marked as full
             }
         }
 
@@ -145,35 +223,144 @@ int AllocateSize(MasterRecord& FileMaster, FILE* FD, uint64_t StartCluster, uint
         }
     }
 
-    if (FoundASuitableRegion){
+    if (!FoundASuitableRegion){
+        std::cout << "Failed to find suitable region" << std::endl;
+        return -1;
+    }
+
+    if(!FreshAllocation){
+        // Find last cluster entry
+        auto FoundClusterEntry = FindClusterEntry(FileMaster, FD, StartCluster, StartSectorIndex);
+        uint64_t ClusterAssociated = StartCluster;
+        while(FoundClusterEntry.NextCluster){
+            ClusterAssociated = FoundClusterEntry.NextCluster;
+            FoundClusterEntry = FindClusterEntry(FileMaster, FD, FoundClusterEntry.NextCluster, FoundClusterEntry.NextSectorIndex);
+        }
+
         for(auto x : Allocations){
-            std::cout << "Would have allocated: " << x.Cluster << " " << x.Sector << " " << x.Count << std::endl;
+            // Update old cluster entry
+            FoundClusterEntry.NextCluster = x.Cluster;
+            FoundClusterEntry.NextSectorIndex = x.Sector;
+
+            { // Update cluster entry with new next sectors
+                // First locate where the cluster map is kept
+                ClusterEntry ClusterEntriesForSector[32] = {};
+                auto ClusterMapEnt = FindClusterMapEntry(FileMaster, FD, ClusterAssociated);
+
+                if((ClusterMapEnt.Flags & 0b1) == 0){
+                    return -1;
+                }
+
+                // In theory a cluster map should be 1 sector, for Lower ClusterSizes that is (<=32)
+                fseek(FD, ((ClusterMapEnt.StoredCluster * FileMaster.ClusterSize + ClusterMapEnt.SectorIndex) * 512), SEEK_SET);
+                fread((void*)(ClusterEntriesForSector), 512, 1, FD);
+                fseek(FD, ((ClusterMapEnt.StoredCluster * FileMaster.ClusterSize + ClusterMapEnt.SectorIndex) * 512), SEEK_SET);
+
+                for(int i = 0; i < 32; i++){
+                    if(ClusterEntriesForSector[i].SectorStart == FoundClusterEntry.SectorStart){
+                        // Found the entry
+                        ClusterEntriesForSector[i] = FoundClusterEntry;
+                        break;
+                    }
+                }
+
+                fwrite((void*)(ClusterEntriesForSector), 512, 1, FD);
+            }
+
+            // Now add new sectorMapEntry Allocation
+            ClusterEntry NewEntry = {(uint8_t)(Flags | 0b1), 0, 0, x.Count, (uint16_t)x.Sector, 0};
+            {
+                // First locate where the cluster map is kept
+                ClusterEntry ClusterEntriesForSector[32] = {};
+                auto ClusterMapEnt = FindClusterMapEntry(FileMaster, FD, x.Cluster);
+
+                if((ClusterMapEnt.Flags & 0b1) == 0){
+                    return -1;
+                }
+
+                // In theory a cluster map should be 1 sector, for Lower ClusterSizes that is (<=32)
+                fseek(FD, ((ClusterMapEnt.StoredCluster * FileMaster.ClusterSize + ClusterMapEnt.SectorIndex) * 512), SEEK_SET);
+                fread((void*)(ClusterEntriesForSector), 512, 1, FD);
+                fseek(FD, ((ClusterMapEnt.StoredCluster * FileMaster.ClusterSize + ClusterMapEnt.SectorIndex) * 512), SEEK_SET);
+
+                ClusterEntriesForSector[x.EntryNumber] = NewEntry;
+
+                fwrite((void*)(ClusterEntriesForSector), 512, 1, FD);
+            }
+
+            // Move to new entry for adding next one
+            FoundClusterEntry = NewEntry;
+            ClusterAssociated = x.Cluster;
+        }
+    }
+    else{
+        // Find last cluster entry
+        ClusterEntry FoundClusterEntry = {};
+        uint64_t ClusterAssociated = 0;
+
+        for(auto x : Allocations){
+            if(FoundClusterEntry.AllocationSize){
+                // Update old cluster entry
+                FoundClusterEntry.NextCluster = x.Cluster;
+                FoundClusterEntry.NextSectorIndex = x.Sector;
+
+                { // Update cluster entry with new next sectors
+                    // First locate where the cluster map is kept
+                    ClusterEntry ClusterEntriesForSector[32] = {};
+                    auto ClusterMapEnt = FindClusterMapEntry(FileMaster, FD, ClusterAssociated);
+
+                    if((ClusterMapEnt.Flags & 0b1) == 0){
+                        return -1;
+                    }
+
+                    // In theory a cluster map should be 1 sector, for Lower ClusterSizes that is (<=32)
+                    fseek(FD, ((ClusterMapEnt.StoredCluster * FileMaster.ClusterSize + ClusterMapEnt.SectorIndex) * 512), SEEK_SET);
+                    fread((void*)(ClusterEntriesForSector), 512, 1, FD);
+                    fseek(FD, ((ClusterMapEnt.StoredCluster * FileMaster.ClusterSize + ClusterMapEnt.SectorIndex) * 512), SEEK_SET);
+
+                    for(int i = 0; i < 32; i++){
+                        if(ClusterEntriesForSector[i].SectorStart == FoundClusterEntry.SectorStart){
+                            // Found the entry
+                            ClusterEntriesForSector[i] = FoundClusterEntry;
+                            break;
+                        }
+                    }
+
+                    fwrite((void*)(ClusterEntriesForSector), 512, 1, FD);
+                }
+            }
+
+            // Now add new sectorMapEntry Allocation
+            ClusterEntry NewEntry = {(uint8_t)(Flags | 0b1), 0, 0, x.Count, (uint16_t)x.Sector, 0};
+            {
+                // First locate where the cluster map is kept
+                ClusterEntry ClusterEntriesForSector[32] = {};
+                auto ClusterMapEnt = FindClusterMapEntry(FileMaster, FD, x.Cluster);
+
+                if((ClusterMapEnt.Flags & 0b1) == 0){
+                    return -1;
+                }
+
+                // In theory a cluster map should be 1 sector, for Lower ClusterSizes that is (<=32)
+                fseek(FD, ((ClusterMapEnt.StoredCluster * FileMaster.ClusterSize + ClusterMapEnt.SectorIndex) * 512), SEEK_SET);
+                fread((void*)(ClusterEntriesForSector), 512, 1, FD);
+                fseek(FD, ((ClusterMapEnt.StoredCluster * FileMaster.ClusterSize + ClusterMapEnt.SectorIndex) * 512), SEEK_SET);
+
+                ClusterEntriesForSector[x.EntryNumber] = NewEntry;
+
+                fwrite((void*)(ClusterEntriesForSector), 512, 1, FD);
+                
+                if(NewAllocationReturnPoint->AllocationSize == 0){
+                    NewAllocationReturnPoint[0] = {0, x.EntryNumber, x.Cluster, x.Count, 0, 0};
+                }
+            }
+
+            // Move to new entry for adding next one
+            FoundClusterEntry = NewEntry;
+            ClusterAssociated = x.Cluster;
         }
     }
 
-    std::cout << "Allocating New Clusters Is Unsupported Right Now" << std::endl;
 
-    return -1;
-}
-
-struct SectorListing{
-    uint64_t Sector = 0;
-    uint16_t Count = 0;
-};
-
-inline std::vector<SectorListing> ParseClusterMapIntoSectors(MasterRecord& FileMaster, FILE* FD, uint64_t StartCluster, uint16_t StartSectorIndex){
-    auto StartClusterEntry = FindClusterEntry(FileMaster, FD, StartCluster, StartSectorIndex);
-
-    std::vector<SectorListing> ReturnVec = {};
-
-    if(StartClusterEntry.NextCluster == 0 && StartClusterEntry.AllocationSize > 0){
-        // No need to search for other clusters
-        ReturnVec.push_back({StartCluster*FileMaster.ClusterSize + StartSectorIndex, StartClusterEntry.AllocationSize});
-
-        return ReturnVec;
-    }
-
-    std::cout << "STUB HIT: " << __FILE__ << "::" << __LINE__ << std::endl;
-
-    return {};
+    return 0;
 }

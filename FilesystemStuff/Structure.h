@@ -41,7 +41,7 @@ struct ClusterMapEntry{
 } __attribute__((__packed__));
 
 struct ClusterEntry{
-    uint8_t State = 0; // () | () | () | () | (FILECONTENT) | (DIRECTORY) | (CLUSTERMAP) | (ALLOCATED)
+    uint8_t State = 0; // () | () | () | (LFN) | (FILECONTENT) | (DIRECTORY) | (CLUSTERMAP) | (ALLOCATED)
 
     // Next Location
     uint16_t NextSectorIndex = 0;
@@ -57,7 +57,7 @@ struct ClusterEntry{
 
 struct DirectoryEntry{
     uint16_t FLAGS = 0; // () | () | () | () | () | () | () | (NoExecute) | (NoREAD) | (NoWRITE) | (EXISTS) | (LINK) | (READONLY) | (DIRECTORY) | (LFN) | (ALLOCATED)
-    char FileName[16] = {0}; // Reserved Data
+    char FileName[16] = {0}; // Reserved Data (8 Bytes cluster + 2 Sector for LFN)
 
     // Location of Data
     uint16_t SectorIndex = 0;

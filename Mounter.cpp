@@ -169,42 +169,90 @@ static void UniFS_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
 	struct fuse_entry_param e;
 
+	size_t NameSize = strlen(name);
+
 	for(auto x : InoMap){
 		if(x.ParentIno == parent){
-			if(x.File.FLAGS & 0b10){
-				std::cout << "LFN are a STUB" << std::endl;
+			if(NameSize > 16 && x.File.FLAGS & 0b10){
+				// Get LFN Content
+				auto LFNSectors = ParseClusterMapIntoSectors(FileMaster, Disk, ((uint64_t*)(x.File.FileName))[0], ((uint16_t*)(x.File.FileName))[6]);
+
+				size_t Size = ((uint32_t*)(x.File.FileName))[2];
+				char* Name = (char*)(malloc(Size));
+				size_t offset = 0;
+				for(auto x : LFNSectors){
+					fseek(Disk, x.Sector*512, SEEK_SET);
+					fread(Name + offset, fmin(Size - offset, x.Count * 512), 1, Disk);
+					offset += fmin(Size - offset, x.Count * 512);
+				}
+
+				// Check name
+				if(strlen(name) == strlen(Name)){
+					if(!memcmp(name, Name, strlen(name))){
+						// Found it
+						memset(&e, 0, sizeof(e));
+						e.ino = x.Ino;
+						e.attr_timeout = 1.0;
+						e.entry_timeout = 1.0;
+						UniFS_stat(e.ino, &e.attr);
+
+						fuse_reply_entry(req, &e);
+						return;
+					}
+				}
+
+				// Could beign with "._"
+				if(strlen(name + 2) == strlen(Name)){
+					if(!memcmp(name + 2, Name, strlen(name + 2))){
+						// Found it
+						memset(&e, 0, sizeof(e));
+						e.ino = x.Ino;
+						e.attr_timeout = 1.0;
+						e.entry_timeout = 1.0;
+						UniFS_stat(e.ino, &e.attr);
+
+						fuse_reply_entry(req, &e);
+						return;
+					}
+				}
+
+				delete Name;
+			}
+			else if(x.File.FLAGS & 0b10){
 				continue;
 			}
+			else{
+				// Check name
+				if(strlen(name) == strlen(x.File.FileName)){
+					if(!memcmp(name, x.File.FileName, strlen(name))){
+						// Found it
+						memset(&e, 0, sizeof(e));
+						e.ino = x.Ino;
+						e.attr_timeout = 1.0;
+						e.entry_timeout = 1.0;
+						UniFS_stat(e.ino, &e.attr);
 
-			// Check name
-			if(strlen(name) == strlen(x.File.FileName)){
-				if(!memcmp(name, x.File.FileName, strlen(name))){
-					// Found it
-					memset(&e, 0, sizeof(e));
-					e.ino = x.Ino;
-					e.attr_timeout = 1.0;
-					e.entry_timeout = 1.0;
-					UniFS_stat(e.ino, &e.attr);
+						fuse_reply_entry(req, &e);
+						return;
+					}
+				}
 
-					fuse_reply_entry(req, &e);
-					return;
+				// Could beign with "._"
+				if(strlen(name + 2) == strlen(x.File.FileName)){
+					if(!memcmp(name + 2, x.File.FileName, strlen(name + 2))){
+						// Found it
+						memset(&e, 0, sizeof(e));
+						e.ino = x.Ino;
+						e.attr_timeout = 1.0;
+						e.entry_timeout = 1.0;
+						UniFS_stat(e.ino, &e.attr);
+
+						fuse_reply_entry(req, &e);
+						return;
+					}
 				}
 			}
 
-			// Could beign with "._"
-			if(strlen(name + 2) == strlen(x.File.FileName)){
-				if(!memcmp(name + 2, x.File.FileName, strlen(name + 2))){
-					// Found it
-					memset(&e, 0, sizeof(e));
-					e.ino = x.Ino;
-					e.attr_timeout = 1.0;
-					e.entry_timeout = 1.0;
-					UniFS_stat(e.ino, &e.attr);
-
-					fuse_reply_entry(req, &e);
-					return;
-				}
-			}
 		}
 	}
 
@@ -302,8 +350,37 @@ static void UniFS_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 						dirbuf_add(req, &b, strdup(Dirs[j].FileName), NextAllocatableIno-1, ((Dirs[j].FLAGS & 0b100) > 0), Dirs[j].FileSize);
 					}
 				}
+				else{
+					// Get LFN Content
+					auto LFNSectors = ParseClusterMapIntoSectors(FileMaster, Disk, ((uint64_t*)(Dirs[j].FileName))[0], ((uint16_t*)(Dirs[j].FileName))[6]);
 
-				// LFN TODO
+					size_t Size = ((uint32_t*)(Dirs[j].FileName))[2];
+					char* Name = (char*)(malloc(Size));
+					size_t offset = 0;
+					for(auto x : LFNSectors){
+						fseek(Disk, x.Sector*512, SEEK_SET);
+						fread(Name + offset, min(Size - offset, x.Count * 512), 1, Disk);
+						offset += min(Size - offset, x.Count * 512);
+					}
+
+					// Do we have it already...
+					bool Done = false;
+					for (auto x : InoMap){
+						if (x.ParentIno == Dir.Ino && !memcmp((void*)(&x.File), (void*)(&Dirs[j]), sizeof(DirectoryEntry))){
+							dirbuf_add(req, &b, strdup(Name), x.Ino, ((x.File.FLAGS & 0b100) > 0), x.File.FileSize);
+							Done=true;
+							break;
+						}
+					}
+					
+					if(!Done){
+						// No Then create it
+						InoMap.push_back({NextAllocatableIno++, Dir.Ino, Dirs[j], (x.Sector + i), (uint64_t)j});
+						dirbuf_add(req, &b, strdup(Name), NextAllocatableIno-1, ((Dirs[j].FLAGS & 0b100) > 0), Dirs[j].FileSize);
+					}
+
+					delete Name;
+				}
 			}
 		}
 	}
@@ -369,9 +446,24 @@ static void UniFS_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
 		       size_t size, off_t off, struct fuse_file_info *fi) {
     auto& Ent = GetIno(ino);
 
-	if (ceil(Ent.File.FileSize/512.0) < ceil((off + size) / 512.0)){
+	if (Ent.File.FileSize < (off + size)){ // No matter what, if we allocate outside of range, try see  if more data is needed (It will skip if it doesnt have to allocate new sectors)
+
+		// Incase of fresh allocation
+		ClusterEntry NewDataAllocation = {};
+
 		// Need to allocate sectors.
-		std::cout << "STUB: CANNOT ALLOCATE SECTORS" << std::endl;
+		if(AllocateSize(FileMaster, Disk, Ent.File.StoredCluster, Ent.File.SectorIndex, (off + size) - Ent.File.FileSize, Ent.File.FileSize, 0b1000 /*FileFlag*/, &NewDataAllocation)){
+			std::cout << "Error Encountered Whilst Allocating!" << std::endl;
+			return;
+		}
+
+		if(NewDataAllocation.AllocationSize){
+			// We need to update the file to contain this new information
+			Ent.File.SectorIndex = NewDataAllocation.NextSectorIndex;
+			Ent.File.StoredCluster = NewDataAllocation.NextCluster;
+		}
+
+		std::cout << "Allocated: " << (off + size) - Ent.File.FileSize << std::endl;
 	}
 
 	// Get File Sectors
@@ -401,7 +493,7 @@ static void UniFS_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
 		BytesWritten += min(512*(s.Count - SectorsIn), size-BytesWritten);
 		fflush(Disk);
 
-		if(BytesWritten == 0){
+		if(BytesWritten == size){
 			break; // Just incase its been overallocated
 		}
 	}
@@ -423,8 +515,6 @@ static void UniFS_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
 	Ent.File.Minute = localTime->tm_min;
 	Ent.File.Second = localTime->tm_sec;
 
-	std::cout << "HMM " << (Ent.SectorOfSettings * 512) + (Ent.EntryNumber * sizeof(DirectoryEntry)) << std::endl;
-
 	fseek(Disk, (Ent.SectorOfSettings * 512) + (Ent.EntryNumber * sizeof(DirectoryEntry)), SEEK_SET);
 	fwrite((void*)(&Ent.File), sizeof(DirectoryEntry), 1, Disk);
 	fflush(Disk);
@@ -433,17 +523,42 @@ static void UniFS_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
 }
 
 static void UniFS_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, struct fuse_file_info *fi) {
-	std::cout << "Create: " << name << std::endl;
-
 	for(auto x : InoMap){
 		if (x.ParentIno == parent){
-			// TODO LFN
+			if(strlen(name) > 16 && x.File.FLAGS & 0b10){
+				// Get LFN Content
+				auto LFNSectors = ParseClusterMapIntoSectors(FileMaster, Disk, ((uint64_t*)(x.File.FileName))[0], ((uint16_t*)(x.File.FileName))[6]);
 
-			if(strlen(name) == strlen(x.File.FileName)){
-				if(!memcmp(name, x.File.FileName, strlen(name))){
-					// Already present
-					fuse_reply_err(req, EALREADY);
-					return;
+				size_t Size = ((uint32_t*)(x.File.FileName))[2];
+				char* Name = (char*)(malloc(Size));
+				size_t offset = 0;
+				for(auto x : LFNSectors){
+					fseek(Disk, x.Sector*512, SEEK_SET);
+					fread(Name + offset, min(Size - offset, x.Count * 512), 1, Disk);
+					offset += min(Size - offset, x.Count * 512);
+				}
+
+				if(strlen(name) == strlen(Name)){
+					if(!memcmp(name, Name, strlen(name))){
+						delete Name;
+						// Already present
+						fuse_reply_err(req, EALREADY);
+						return;
+					}
+				}
+
+				delete Name;
+			}
+			else if(x.File.FLAGS & 0b10){
+				continue;
+			}
+			else{
+				if(strlen(name) == strlen(x.File.FileName)){
+					if(!memcmp(name, x.File.FileName, strlen(name))){
+						// Already present
+						fuse_reply_err(req, EALREADY);
+						return;
+					}
 				}
 			}
 		}
@@ -492,10 +607,31 @@ static void UniFS_create(fuse_req_t req, fuse_ino_t parent, const char *name, mo
 				Dirs[j].Second = localTime->tm_sec;
 
 				if(strlen(name) > 16){
-					std::cout << "Cannot Use LFN on new file!" << std::endl;
+					Dirs[j].FLAGS |= 0b10;
+
+					// Allocate a new sector for filename
+					ClusterEntry ReturnValue = {};
+					if(AllocateSize(FileMaster, Disk, 0, 0, strlen(name), 0, 0b10000, &ReturnValue)){
+						std::cout << "Failed to allocate LFN" << std::endl;
+						return; // ERRORO
+					}
+
+					uint8_t * data = (uint8_t*)malloc(512);
+					memset(data, 0, 512);
+					memcpy(data, name, strlen(name));
+					fseek(Disk, (ReturnValue.NextCluster * FileMaster.ClusterSize + ReturnValue.NextSectorIndex) * 512, SEEK_SET);
+					fwrite(data, 512, 1, Disk);
+
+					delete data;
+
+					data = (uint8_t*)Dirs[j].FileName;
+					((uint64_t*)data)[0] = ReturnValue.NextCluster;
+					((uint32_t*)data)[2] = strlen(name);
+					((uint16_t*)data)[6] = ReturnValue.NextSectorIndex;
 				}
-				
-				strncpy(Dirs[j].FileName, name, min(16, strlen(name)));
+				else{
+					strncpy(Dirs[j].FileName, name, min(16, strlen(name)));
+				}
 
 				InoMap.push_back({NextAllocatableIno++, parent, Dirs[j], x.Sector + i, (uint64_t)j});
 
@@ -512,8 +648,6 @@ static void UniFS_create(fuse_req_t req, fuse_ino_t parent, const char *name, mo
 
 				fuse_reply_create(req, &e, fi);
 				return;
-
-				// TODO LFN
 			}
 		}
 	}

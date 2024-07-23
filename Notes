@@ -4,3 +4,4 @@ Cluster Map Allocations:
 
 TODOS:
     - Add checks for entry types and if they are actually files/directories/clusters
+    - Parse Mappings into cluster and sector to alow for a larger System range to be founbd (Not limited to uint64_t instead of uint64_t+uint16_t)
