@@ -73,4 +73,5 @@ struct DirectoryEntry{
 
     uint64_t FileSize = 0;
     uint32_t Reserved1 = 0;
+    uint16_t Reserved2 = 0;
 } __attribute__((__packed__));
